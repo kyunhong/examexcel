@@ -55,31 +55,32 @@ def calc_grade_table(df_stat: pd.DataFrame) -> list:
     boundaries = get_boundaries(total)
     응시생수   = total
     원점수평균 = round(float(df_stat["원점수"].mean()), 2)
-
     rows     = []
     prev_end = 0
-
     for g in range(1, 6):
         grade_df   = df_stat[df_stat["예상등급"] == g]
         rank_start = prev_end + 1
         rank_end   = boundaries[g - 1]
         rank_range = f"{rank_start}~{rank_end}"
-
         if len(grade_df) == 0:
             cutline = "-"
         elif g == 5:
             cutline = 0
         else:
             cutline = round(float(grade_df["원점수"].min()), 1)
-
         rows.append({
-            "등급":      f"{g}등급",
-            "커트라인":  cutline,
-            "석차범위":  rank_range,
+            "등급":     f"{g}등급",
+            "커트라인": cutline,
+            "석차범위": rank_range,
         })
         prev_end = rank_end
-
     return rows, 응시생수, 원점수평균
+
+def parse_subject_unit(raw: str) -> int:
+    if not isinstance(raw, str):
+        return None
+    match = re.search(r"\((\d+)\)\s*$", raw.strip())
+    return int(match.group(1)) if match else None
 
 def parse_subject_name(raw: str) -> str:
     if not isinstance(raw, str):
@@ -93,10 +94,11 @@ def parse_subject_name(raw: str) -> str:
 def is_subject_cell(val_str: str) -> bool:
     return bool(re.search(r".+:.+\(\d+\)\s*$", val_str))
 
-def parse_nice_excel(file) -> pd.DataFrame:
+def parse_nice_excel(file) -> tuple:
     df_raw = pd.read_excel(file, header=None, dtype=str)
     df_raw = df_raw.fillna("")
     all_records = []
+    unit_dict   = {}
 
     block_start_rows = []
     for row_idx in range(len(df_raw)):
@@ -106,7 +108,7 @@ def parse_nice_excel(file) -> pd.DataFrame:
 
     if not block_start_rows:
         st.error("학년도/반 정보를 찾을 수 없습니다.")
-        return pd.DataFrame()
+        return pd.DataFrame(), {}
 
     block_start_rows.append(len(df_raw))
     st.info(f"📋 감지된 반 블록 수: **{len(block_start_rows)-1}개**")
@@ -137,7 +139,11 @@ def parse_nice_excel(file) -> pd.DataFrame:
         for col_idx, val in enumerate(subject_row):
             val_str = str(val).strip()
             if is_subject_cell(val_str):
-                subject_cols[col_idx] = parse_subject_name(val_str)
+                subj_name = parse_subject_name(val_str)
+                subj_unit = parse_subject_unit(val_str)
+                subject_cols[col_idx] = subj_name
+                if subj_name not in unit_dict and subj_unit is not None:
+                    unit_dict[subj_name] = subj_unit
 
         if not subject_cols:
             st.warning(f"⚠️ {cls}반: 과목 열을 찾을 수 없습니다.")
@@ -207,8 +213,8 @@ def parse_nice_excel(file) -> pd.DataFrame:
                 })
 
     if not all_records:
-        return pd.DataFrame()
-    return pd.DataFrame(all_records)
+        return pd.DataFrame(), unit_dict
+    return pd.DataFrame(all_records), unit_dict
 
 def make_subject_stat(result_wide, subj_cols):
     stat_dict = {}
@@ -246,6 +252,20 @@ def make_grade_wide(students_df, stat_dict, subj_cols):
         key=lambda x: pd.to_numeric(x, errors="coerce")
     ).reset_index(drop=True)
     return grade_wide
+
+def calc_weighted_grade(row, subj_cols, unit_dict):
+    total_weight = 0
+    total_score  = 0
+    for subj in subj_cols:
+        grade = row.get(subj, np.nan)
+        unit  = unit_dict.get(subj, None)
+        if pd.isna(grade) or unit is None:
+            continue
+        total_weight += unit
+        total_score  += grade * unit
+    if total_weight == 0:
+        return np.nan
+    return round(total_score / total_weight, 2)
 
 # ── UI ────────────────────────────────────────────────────────
 st.header("Step 1️⃣  전교생 명단 업로드")
@@ -296,15 +316,23 @@ nice_file = st.file_uploader(
     "나이스 지필평가 학급별 일람표 엑셀", type=["xlsx","xls"], key="nice")
 
 nice_long_df = None
+unit_dict    = {}
 if nice_file:
     with st.spinner("파일 파싱 중..."):
-        nice_long_df = parse_nice_excel(nice_file)
+        nice_long_df, unit_dict = parse_nice_excel(nice_file)
 
     if nice_long_df is not None and len(nice_long_df) > 0:
         subjects_found = sorted(nice_long_df["과목명"].unique().tolist())
         col_info1, col_info2 = st.columns(2)
         col_info1.metric("감지된 과목 수",   f"{len(subjects_found)}개")
         col_info2.metric("성적 데이터 행수", f"{len(nice_long_df)}행")
+
+        with st.expander("📐 과목별 단위수 확인"):
+            unit_df = pd.DataFrame(
+                unit_dict.items(), columns=["과목명","단위수"]
+            ).sort_values("과목명").reset_index(drop=True)
+            st.dataframe(unit_df, use_container_width=True)
+
         with st.expander("📚 감지된 과목 목록"):
             for i, subj in enumerate(subjects_found, 1):
                 st.write(f"{i}. {subj}")
@@ -386,11 +414,17 @@ if st.button("🚀 성적 취합 실행", type="primary", use_container_width=Tr
                 stat_dict, subj_cols
             )
 
+            grade_wide["평균등급(단위수반영)"] = grade_wide.apply(
+                lambda row: calc_weighted_grade(row, subj_cols, unit_dict),
+                axis=1
+            )
+
             st.session_state["result_wide"] = result_wide
             st.session_state["grade_wide"]  = grade_wide
             st.session_state["nice_long"]   = nice_df
             st.session_state["subj_cols"]   = subj_cols
             st.session_state["stat_dict"]   = stat_dict
+            st.session_state["unit_dict"]   = unit_dict
 
         st.success(f"✅ 취합 완료! **{len(result_wide)}명** / **{len(subj_cols)}개 과목**")
 
@@ -402,6 +436,7 @@ if "result_wide" in st.session_state:
     nice_long   = st.session_state["nice_long"]
     subj_cols   = st.session_state["subj_cols"]
     stat_dict   = st.session_state["stat_dict"]
+    unit_dict   = st.session_state["unit_dict"]
 
     c1, c2, c3 = st.columns(3)
     c1.metric("전체 학생", f"{len(result_wide)}명")
@@ -430,6 +465,7 @@ if "result_wide" in st.session_state:
         fmt_info_header    = mfmt({"font_size":11,"bg_color":"#C8B4E0","align":"center","valign":"vcenter","border":1,"text_wrap":True})
         fmt_subj_header    = mfmt({"font_size":11,"bg_color":"#C8E6C8","align":"center","valign":"vcenter","border":1,"text_wrap":True})
         fmt_avg_header     = mfmt({"font_size":11,"bg_color":"#FFF0B0","align":"center","valign":"vcenter","border":1,"text_wrap":True})
+        fmt_wavg_header    = mfmt({"font_size":11,"bg_color":"#FFD9B0","align":"center","valign":"vcenter","border":1,"text_wrap":True})
         fmt_stat_score_hdr = mfmt({"font_size":11,"bg_color":"#C8E6C8","align":"center","valign":"vcenter","border":1,"text_wrap":True})
         fmt_stat_rank_hdr  = mfmt({"font_size":11,"bg_color":"#FFD9B0","align":"center","valign":"vcenter","border":1,"text_wrap":True})
         fmt_stat_grade_hdr = mfmt({"font_size":11,"bg_color":"#B0D4FF","align":"center","valign":"vcenter","border":1,"text_wrap":True})
@@ -437,6 +473,7 @@ if "result_wide" in st.session_state:
         fmt_info           = mfmt({"font_size":11,"bg_color":"#FFFFFF","align":"center","valign":"vcenter","border":1})
         fmt_score          = mfmt({"font_size":11,"bg_color":"#FFFFFF","align":"center","valign":"vcenter","border":1,"num_format":"0.00"})
         fmt_avg_score      = mfmt({"font_size":11,"bg_color":"#FFFFFF","align":"center","valign":"vcenter","border":1,"num_format":"0.0"})
+        fmt_wavg_val       = mfmt({"font_size":11,"bg_color":"#FFFFFF","align":"center","valign":"vcenter","border":1,"num_format":"0.00"})
         fmt_empty          = mfmt({"bg_color":"#FFFFFF","border":1})
         fmt_special        = mfmt({"font_size":11,"align":"center","valign":"vcenter","border":1,"font_color":"#C00000","bg_color":"#FFE0E0"})
         fmt_cell           = mfmt({"font_size":11,"align":"center","valign":"vcenter","border":1})
@@ -455,14 +492,14 @@ if "result_wide" in st.session_state:
         COL_GTITLE = 8
         COL_GCUT   = 9
         COL_GRANGE = 10
-        # ✅ 응시생수/원점수평균: 커트라인/석차범위와 같은 열 사용
-        COL_GCNT   = COL_GTITLE   # 8열
-        COL_GAVG   = COL_GCUT     # 9열
+        COL_GCNT   = COL_GTITLE
+        COL_GAVG   = COL_GCUT
 
         def get_header_fmt(col_name):
-            if col_name in info_cols: return fmt_info_header
-            elif col_name == "평균":  return fmt_avg_header
-            else:                     return fmt_subj_header
+            if col_name in info_cols:                return fmt_info_header
+            elif col_name == "평균":                 return fmt_avg_header
+            elif col_name == "평균등급(단위수반영)":  return fmt_wavg_header
+            else:                                    return fmt_subj_header
 
         def write_data_cell(ws, row, col, val, col_name):
             if col_name in info_cols:
@@ -471,6 +508,10 @@ if "result_wide" in st.session_state:
                 ws.write(row, col,
                          "" if pd.isna(val) else val,
                          fmt_empty if pd.isna(val) else fmt_avg_score)
+            elif col_name == "평균등급(단위수반영)":
+                ws.write(row, col,
+                         "" if pd.isna(val) else val,
+                         fmt_empty if pd.isna(val) else fmt_wavg_val)
             elif pd.isna(val):
                 ws.write(row, col, "", fmt_empty)
             elif isinstance(val, str):
@@ -496,19 +537,35 @@ if "result_wide" in st.session_state:
         writer.sheets["예상등급"] = ws_grd
         ws_grd.freeze_panes(1, 3)
         ws_grd.set_row(0, 25)
-        grade_cols = info_cols + subj_cols
+
+        grade_cols = info_cols + subj_cols + ["평균등급(단위수반영)"]
+
         for c_idx, col_name in enumerate(grade_cols):
-            ws_grd.write(0, c_idx, col_name, get_header_fmt(col_name))
+            # ✅ 과목명에만 (단위수) 붙이기
+            if col_name in info_cols or col_name == "평균등급(단위수반영)":
+                display_name = col_name
+            else:
+                unit = unit_dict.get(col_name, None)
+                display_name = f"{col_name}({unit})" if unit is not None else col_name
+
+            ws_grd.write(0, c_idx, display_name, get_header_fmt(col_name))
             ws_grd.set_column(c_idx, c_idx, 10)
+
+        # ✅ 학생 데이터 (바로 1행부터, 단위수 별도 행 없음)
         for r_idx, row in grade_wide[grade_cols].iterrows():
+            excel_row = r_idx + 1
             for c_idx, col_name in enumerate(grade_cols):
                 val = row[col_name]
                 if col_name in info_cols:
-                    ws_grd.write(r_idx+1, c_idx, val, fmt_info)
+                    ws_grd.write(excel_row, c_idx, val, fmt_info)
+                elif col_name == "평균등급(단위수반영)":
+                    ws_grd.write(excel_row, c_idx,
+                                 "" if pd.isna(val) else val,
+                                 fmt_empty if pd.isna(val) else fmt_wavg_val)
                 elif pd.isna(val):
-                    ws_grd.write(r_idx+1, c_idx, "", fmt_empty)
+                    ws_grd.write(excel_row, c_idx, "", fmt_empty)
                 else:
-                    ws_grd.write(r_idx+1, c_idx, int(val), fmt_grade_val)
+                    ws_grd.write(excel_row, c_idx, int(val), fmt_grade_val)
 
         # ── 시트3~N: 반별 시트 ────────────────────────────────
         sorted_cls_list = sorted(result_wide["반"].unique(), key=lambda x: int(x))
@@ -577,44 +634,24 @@ if "result_wide" in st.session_state:
                 ws_st.freeze_panes(1, 3)
                 ws_st.set_row(0, 25)
 
-                # 학생 데이터 열 헤더 + 너비
                 for c_idx, col_name in enumerate(stat_cols):
                     ws_st.write(0, c_idx, col_name, stat_header_map[col_name])
                     ws_st.set_column(c_idx, c_idx, stat_width_map[col_name])
 
-                # 등급컷 표 열 너비
                 ws_st.set_column(COL_GAP,    COL_GAP,    2)
                 ws_st.set_column(COL_GTITLE, COL_GTITLE, 12)
                 ws_st.set_column(COL_GCUT,   COL_GCUT,   10)
                 ws_st.set_column(COL_GRANGE, COL_GRANGE, 12)
 
-                # ──────────────────────────────────────────────
-                # 등급컷 표 레이아웃
-                #
-                # 0행: (학생헤더와 같은 행 → 등급컷 열은 빈칸)
-                # 1행: [과목명] [커트라인] [석차범위]
-                # 2행: [1등급]  [94.0]    [1~9]
-                # 3행: [2등급]  [83.1]    [10~31]
-                # 4행: [3등급]  [48.9]    [32~61]
-                # 5행: [4등급]  [29.2]    [62~83]
-                # 6행: [5등급]  [0.0]     [84~92]
-                # 7행: (빈 행)
-                # 8행: [응시생수] [원점수평균]
-                # 9행: [92]       [62.55]
-                # ──────────────────────────────────────────────
-
                 grade_table, 응시생수, 원점수평균 = calc_grade_table(df_stat)
 
-                # 0행: 빈칸 (학생 헤더와 같은 행)
                 for c in [COL_GTITLE, COL_GCUT, COL_GRANGE]:
                     ws_st.write(0, c, "", None)
 
-                # 1행: 등급컷 헤더
                 ws_st.write(1, COL_GTITLE, subj,        fmt_gt_title)
                 ws_st.write(1, COL_GCUT,   "커트라인",  fmt_gt_title)
                 ws_st.write(1, COL_GRANGE, "석차 범위", fmt_gt_title)
 
-                # 2~6행: 등급컷 데이터
                 for g_idx, g_row in enumerate(grade_table):
                     r = g_idx + 2
                     ws_st.write(r, COL_GTITLE, g_row["등급"], fmt_gt_label)
@@ -625,19 +662,14 @@ if "result_wide" in st.session_state:
                         ws_st.write(r, COL_GCUT,   g_row["커트라인"], fmt_gt_cut)
                         ws_st.write(r, COL_GRANGE, g_row["석차범위"],  fmt_gt_range)
 
-                # 7행: 빈 행 (구분선 역할)
                 for c in [COL_GTITLE, COL_GCUT, COL_GRANGE]:
                     ws_st.write(7, c, "", None)
 
-                # 8행: 응시생수/원점수평균 헤더
                 ws_st.write(8, COL_GCNT, "응시생수",   fmt_gt_title)
                 ws_st.write(8, COL_GAVG, "원점수평균", fmt_gt_title)
+                ws_st.write(9, COL_GCNT, 응시생수,     fmt_gt_cnt)
+                ws_st.write(9, COL_GAVG, 원점수평균,   fmt_gt_avg)
 
-                # 9행: 응시생수/원점수평균 값
-                ws_st.write(9, COL_GCNT, 응시생수,   fmt_gt_cnt)
-                ws_st.write(9, COL_GAVG, 원점수평균, fmt_gt_avg)
-
-                # 학생 데이터 (1행~)
                 for r_idx, row in df_stat[stat_cols].iterrows():
                     excel_row = r_idx + 1
                     for c_idx, col_name in enumerate(stat_cols):
